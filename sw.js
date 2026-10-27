@@ -5,7 +5,7 @@
 //    avec prise en charge des requêtes Range pour l'avance rapide.
 //    Rien n'est écrit sur le téléphone.
 
-const VERSION = 'v1'
+const VERSION = 'v2'
 const SHELL_CACHE = `megatheque-shell-${VERSION}`
 const SHELL = [
   './',

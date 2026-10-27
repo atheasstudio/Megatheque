@@ -1,5 +1,12 @@
 import { File } from './vendor/megajs-1.3.10.mjs'
 
+// megajs ne conserve pas les "file attributes" (miniatures) des nœuds : on les garde au passage.
+const originalLoadMetadata = File.prototype.loadMetadata
+File.prototype.loadMetadata = function (aes, opt) {
+  originalLoadMetadata.call(this, aes, opt)
+  this.fa = opt.fa
+}
+
 // ---------- Stockage local (uniquement sur le téléphone) ----------
 
 const STORE_KEY = 'megatheque.folders'
@@ -13,7 +20,7 @@ function writeJSON (key, value) {
 }
 
 let folders = readJSON(STORE_KEY, [])
-const prefs = Object.assign({ filter: 'all', sort: 'name', dir: 1 }, readJSON(PREFS_KEY, {}))
+const prefs = Object.assign({ filter: 'all', sort: 'name', dir: 1, layout: 'grid' }, readJSON(PREFS_KEY, {}))
 const saveFolders = () => writeJSON(STORE_KEY, folders)
 const savePrefs = () => writeJSON(PREFS_KEY, prefs)
 
@@ -60,7 +67,11 @@ const ICONS = {
   folder: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
   video: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3z"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
-  dots: '<svg viewBox="0 0 24 24" style="stroke:currentColor"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>'
+  dots: '<svg viewBox="0 0 24 24" style="stroke:currentColor"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>',
+  grid: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>',
+  list: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
+  muted: '<svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M22 9l-6 6M16 9l6 6"/></svg>',
+  sound: '<svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>'
 }
 function icon (kind) {
   const span = el('span', { class: `ico ${kind}` })
@@ -110,6 +121,123 @@ function countVideos (node) {
   videoCounts.set(node, n)
   return n
 }
+
+// ---------- Miniatures MEGA ----------
+// Chaque fichier peut porter des attributs "fa" du type "924:0*HANDLE/924:1*HANDLE" :
+// 0 = miniature (120 px), 1 = aperçu (jusqu'à 1000 px). L'image est chiffrée en AES-CBC
+// avec la clé du fichier. On garde les images déchiffrées dans le cache du navigateur
+// (quelques Ko chacune) pour ne pas les redemander à chaque ouverture.
+
+const THUMB_CACHE = 'megatheque-thumbs-v1'
+const thumbUrls = new Map() // handle -> Promise<objectURL|null>
+
+function thumbHandle (node) {
+  if (!node.fa || !node.key) return null
+  const attrs = Object.fromEntries(node.fa.split('/').map((part) => {
+    const m = /:(\d+)\*([\w-]+)/.exec(part)
+    return m ? [m[1], m[2]] : [null, null]
+  }))
+  return attrs[1] || attrs[0] || null
+}
+
+function thumbnailFor (node, rootHandle) {
+  const fah = thumbHandle(node)
+  if (!fah) return Promise.resolve(null)
+  if (!thumbUrls.has(fah)) {
+    const p = fetchThumbnail(node, fah, rootHandle).catch((err) => {
+      console.warn('Miniature indisponible', err)
+      return null
+    })
+    thumbUrls.set(fah, p)
+  }
+  return thumbUrls.get(fah)
+}
+
+async function fetchThumbnail (node, fah, rootHandle) {
+  const cacheKey = new URL(`thumb/${fah}`, location.href).href
+  let cache = null
+  try { cache = await caches.open(THUMB_CACHE) } catch {}
+  const cached = cache && await cache.match(cacheKey)
+  if (cached) return URL.createObjectURL(await cached.blob())
+
+  const res = await node.api.request({ a: 'ufa', fah, ssl: 2, r: 1, _querystring: { n: rootHandle } })
+  if (!res || typeof res.p !== 'string') throw new Error('pas d\'URL de miniature')
+  const body = b64urlDecode(fah)
+  let data = null
+  for (const url of [res.p, `${res.p}/0`]) {
+    const r = await fetch(url, { method: 'POST', body })
+    if (!r.ok) continue
+    data = parseFaResponse(new Uint8Array(await r.arrayBuffer()), body)
+    if (data) break
+  }
+  if (!data) throw new Error('réponse de miniature illisible')
+  const jpeg = await aesCbcDecryptNoPad(fileAesKey(node.key), data)
+  const blob = new Blob([jpeg], { type: 'image/jpeg' })
+  if (cache) cache.put(cacheKey, new Response(blob)).catch(() => {})
+  return URL.createObjectURL(blob)
+}
+
+// Réponse : [8 octets handle][4 octets longueur, little-endian][données], répété.
+function parseFaResponse (buf, handle) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  let pos = 0
+  while (pos + 12 <= buf.length) {
+    const h = buf.subarray(pos, pos + 8)
+    const len = view.getUint32(pos + 8, true)
+    const start = pos + 12
+    if (len === 0 || start + len > buf.length) return null
+    if (h.every((b, i) => b === handle[i]) && len % 16 === 0) return buf.slice(start, start + len)
+    pos = start + len
+  }
+  return null
+}
+
+function fileAesKey (key) {
+  const k = new Uint8Array(16)
+  for (let i = 0; i < 16; i++) k[i] = key.length === 32 ? key[i] ^ key[16 + i] : key[i]
+  return k
+}
+
+// AES-CBC sans padding (IV nul). WebCrypto exige un padding PKCS#7 :
+// on ajoute un bloc chiffré qui se déchiffre en padding valide.
+async function aesCbcDecryptNoPad (rawKey, data) {
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-CBC', false, ['encrypt', 'decrypt'])
+  const last = data.slice(data.length - 16)
+  const padBlock = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-CBC', iv: last }, key, new Uint8Array(16).fill(16))).slice(0, 16)
+  const full = new Uint8Array(data.length + 16)
+  full.set(data, 0)
+  full.set(padBlock, data.length)
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: new Uint8Array(16) }, key, full))
+}
+
+function b64urlDecode (s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/')
+  while (s.length % 4) s += '='
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
+}
+
+const rootOf = (node) => Array.isArray(node.downloadId) ? node.downloadId[0] : node.downloadId
+
+function firstVideo (node) {
+  for (const c of node.children || []) if (isVideo(c) && thumbHandle(c)) return c
+  for (const c of node.children || []) if (c.directory) { const v = firstVideo(c); if (v) return v }
+  return null
+}
+
+const lazyThumbs = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue
+    lazyThumbs.unobserve(entry.target)
+    const { node } = entry.target._thumb
+    thumbnailFor(node, rootOf(node)).then((url) => {
+      if (!url) return
+      const img = el('img', { alt: '', decoding: 'async', src: url })
+      img.onload = () => entry.target.classList.add('has-thumb')
+      entry.target.prepend(img)
+    })
+  }
+}, { rootMargin: '300px' })
 
 function megaError (err) {
   const msg = String(err && err.message || err)
@@ -288,8 +416,10 @@ async function renderFolder (id, path, fresh = false) {
     countEl.textContent = items.length
       ? `${plural(items.filter((c) => c.directory).length, 'dossier', 'dossiers')} · ${plural(items.filter(isVideo).length, 'vidéo', 'vidéos')}`
       : ''
+    stopPreview()
+    listEl.className = prefs.layout === 'grid' ? 'grid' : 'list'
     listEl.replaceChildren(...(items.length
-      ? items.map((c) => itemFor(c, id, path))
+      ? items.map((c) => prefs.layout === 'grid' ? tileFor(c, id, path) : itemFor(c, id, path))
       : [el('li', { class: 'empty' }, q ? 'Aucun résultat.' : 'Rien à afficher ici.')]))
   }
 
@@ -313,6 +443,15 @@ async function renderFolder (id, path, fresh = false) {
     'aria-label': 'Inverser l\'ordre',
     onclick: () => { prefs.dir *= -1; savePrefs(); dirBtn.textContent = prefs.dir > 0 ? '↑' : '↓'; fill() }
   }, prefs.dir > 0 ? '↑' : '↓')
+  const layoutBtn = el('button', {
+    'aria-label': 'Changer l\'affichage',
+    onclick: () => {
+      prefs.layout = prefs.layout === 'grid' ? 'list' : 'grid'; savePrefs()
+      layoutBtn.innerHTML = prefs.layout === 'grid' ? ICONS.list : ICONS.grid
+      fill()
+    }
+  })
+  layoutBtn.innerHTML = prefs.layout === 'grid' ? ICONS.list : ICONS.grid
 
   const search = el('input', {
     class: 'search', type: 'search', placeholder: 'Rechercher dans ce dossier', value: searchText,
@@ -320,7 +459,7 @@ async function renderFolder (id, path, fresh = false) {
   })
 
   view.replaceChildren(
-    el('div', { class: 'toolbar' }, seg, el('div', { class: 'sort' }, select, dirBtn), search),
+    el('div', { class: 'toolbar' }, seg, el('div', { class: 'sort' }, select, dirBtn, layoutBtn), search),
     countEl,
     listEl
   )
@@ -353,27 +492,153 @@ const player = $('#player')
 const video = $('#video')
 const playerMsg = $('#player-msg')
 
-async function play (node) {
+async function streamUrl (node) {
   if (!('serviceWorker' in navigator)) {
     toast('Ton navigateur ne permet pas la lecture en streaming. Utilise Chrome.')
-    return
+    return null
   }
   const reg = await navigator.serviceWorker.ready
   if (!navigator.serviceWorker.controller) {
     // Première ouverture : le service worker n'a pas encore pris la main sur la page.
     toast('Initialisation… relance la vidéo dans une seconde.')
     location.reload()
-    return
+    return null
   }
   const [root, h] = node.downloadId
-  const src = new URL(`stream/${root}/${h}/${b64url(node.key)}/${node.size}/${encodeURIComponent(node.name)}`, reg.scope)
+  return new URL(`stream/${root}/${h}/${b64url(node.key)}/${node.size}/${encodeURIComponent(node.name)}`, reg.scope).href
+}
+
+async function play (node, startAt = 0) {
+  const src = await streamUrl(node)
+  if (!src) return
+  stopPreview()
   $('#player-title').textContent = node.name
   playerMsg.hidden = true
   player.hidden = false
   history.pushState({ player: true }, '')
-  video.src = src.href
+  video.src = src
+  if (startAt) video.currentTime = startAt
   video.play().catch(() => {})
 }
+
+// ---------- Grille et aperçu au doigt ----------
+
+const LONG_PRESS_MS = 350
+let preview = null // { tile, video }
+
+function tileFor (node, id, path) {
+  if (node.directory) {
+    const videos = countVideos(node)
+    const tile = el('li', {
+      class: 'tile folder-tile',
+      onclick: () => { searchText = ''; location.hash = `#/f/${[id, ...path, handleOf(node)].join('/')}` }
+    },
+    el('div', { class: 'tile-placeholder' }, icon('folder')),
+    el('span', { class: 'badge' }, icon('folder')),
+    el('div', { class: 'tile-caption' },
+      el('div', { class: 'name' }, node.name || '(sans nom)'),
+      el('div', { class: 'meta' }, plural(videos, 'vidéo', 'vidéos'))))
+    const cover = firstVideo(node)
+    if (cover) { tile._thumb = { node: cover }; lazyThumbs.observe(tile) }
+    return tile
+  }
+
+  const video = isVideo(node)
+  const soundBtn = el('button', { class: 'sound-btn', 'aria-label': 'Activer le son', hidden: true })
+  soundBtn.innerHTML = ICONS.muted
+  const tile = el('li', { class: `tile${video ? '' : ' disabled'}` },
+    el('div', { class: 'tile-placeholder' }, icon(video ? 'video' : 'file')),
+    soundBtn,
+    el('div', { class: 'tile-caption' },
+      el('div', { class: 'name' }, node.name || '(sans nom)'),
+      el('div', { class: 'meta' }, formatSize(node.size))))
+  tile._thumb = { node }
+  if (thumbHandle(node)) lazyThumbs.observe(tile)
+  if (!video) {
+    tile.addEventListener('click', () => toast('Seules les vidéos peuvent être lues ici.'))
+    return tile
+  }
+
+  // Appui court : lecture plein écran. Appui long : aperçu muet dans la vignette.
+  let timer = null
+  let startX = 0
+  let startY = 0
+  let longPressed = false
+  const cancel = () => { clearTimeout(timer); timer = null }
+
+  tile.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.sound-btn')) return
+    longPressed = false
+    startX = e.clientX
+    startY = e.clientY
+    cancel()
+    timer = setTimeout(() => {
+      timer = null
+      longPressed = true
+      if (navigator.vibrate) navigator.vibrate(15)
+      startPreview(tile, node, soundBtn)
+    }, LONG_PRESS_MS)
+  })
+  tile.addEventListener('pointermove', (e) => {
+    if (timer && Math.hypot(e.clientX - startX, e.clientY - startY) > 10) cancel()
+  })
+  tile.addEventListener('pointercancel', cancel)
+  tile.addEventListener('pointerleave', cancel)
+  tile.addEventListener('contextmenu', (e) => e.preventDefault())
+  tile.addEventListener('click', (e) => {
+    if (e.target.closest('.sound-btn')) return
+    cancel()
+    if (longPressed) { longPressed = false; return }
+    const at = preview && preview.tile === tile ? preview.video.currentTime : 0
+    play(node, at)
+  })
+  soundBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    if (!preview || preview.tile !== tile) return
+    preview.video.muted = !preview.video.muted
+    soundBtn.innerHTML = preview.video.muted ? ICONS.muted : ICONS.sound
+    soundBtn.setAttribute('aria-label', preview.video.muted ? 'Activer le son' : 'Couper le son')
+  })
+  return tile
+}
+
+async function startPreview (tile, node, soundBtn) {
+  if (preview && preview.tile === tile) return
+  stopPreview()
+  const src = await streamUrl(node)
+  if (!src) return
+  const v = el('video', { class: 'tile-video', muted: true, playsinline: true, loop: true, preload: 'auto' })
+  v.muted = true
+  v.src = src
+  tile.classList.add('previewing')
+  tile.append(v)
+  soundBtn.hidden = false
+  soundBtn.innerHTML = ICONS.muted
+  preview = { tile, video: v, soundBtn }
+  v.addEventListener('playing', () => tile.classList.add('playing'), { once: true })
+  v.play().catch(() => {})
+  previewObserver.observe(tile)
+}
+
+function stopPreview () {
+  if (!preview) return
+  const { tile, video: v, soundBtn } = preview
+  preview = null
+  previewObserver.unobserve(tile)
+  v.pause()
+  v.removeAttribute('src')
+  v.load()
+  v.remove()
+  soundBtn.hidden = true
+  tile.classList.remove('previewing', 'playing')
+}
+
+// L'aperçu s'arrête dès que la vignette sort de l'écran.
+const previewObserver = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting && preview && preview.tile === entry.target) stopPreview()
+  }
+})
 
 function closePlayer () {
   video.pause()
@@ -404,7 +669,8 @@ function render () {
   }
 }
 
-window.addEventListener('hashchange', () => { if (!player.hidden) closePlayer(); render() })
+window.addEventListener('hashchange', () => { stopPreview(); if (!player.hidden) closePlayer(); render() })
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopPreview() })
 window.addEventListener('popstate', () => { if (!player.hidden) closePlayer() })
 $('#back').addEventListener('click', () => {
   const route = currentRoute()
